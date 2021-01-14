@@ -1,5 +1,5 @@
 task: create_from_files
-host: "http://localhost:8000"
+host: "http://97.107.189.30"
 username: admin
 password: islandora
 # This directory must match the on defined in the script's 'dest_dir' variable.
