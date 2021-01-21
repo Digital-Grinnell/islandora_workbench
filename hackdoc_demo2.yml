@@ -1,0 +1,8 @@
+task: create
+host: "http://97.107.189.30"
+username: admin
+password: islandora
+allow_Adding_terms: true
+Google_sheets_gid: 1094504353
+# input_csv: google_sheet.csv
+input_csv: 'https://docs.google.com/spreadsheets/d/12QezZCbW2ZIO8WJd8kpMgnt6OI-JVSXQ-rTs-0LA4mI/edit?usp=sharing'
