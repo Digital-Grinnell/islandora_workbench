@@ -40,7 +40,13 @@ def set_config_defaults(args):
     try:
         with open(args.config, 'r') as f:
             config_file_contents = f.read()
-            config_data = yaml.load(config_file_contents)
+            original_config_data = yaml.load(config_file_contents)
+            # Convert all keys to lower case.
+            config_data = collections.OrderedDict()
+            for k, v in original_config_data.items():
+                if isinstance(k, str):
+                    k = k.lower()
+                    config_data[k] = v
     except YAMLError as e:
         # Since the main logger gets its log file location from this file, we
         # need to define a local logger to write to the default log file location,
@@ -583,7 +589,7 @@ def check_input(config, args):
     # The actual "extraction" is fired over in workbench.
     elif config['input_csv'].startswith('http'):
         input_csv = os.path.join(config['input_dir'], config['google_sheets_csv_filename'])
-        message = "Extracting CSV data from " + config['input_csv'] + " to " + input_csv + '.'
+        message = "Extracting CSV data from " + config['input_csv'] + " (worksheet gid " + str(config['google_sheets_gid']) + ") to " + input_csv + '.'
         print(message)
         logging.info(message)
     elif config['input_csv'].endswith('xlsx'):
@@ -1402,8 +1408,7 @@ def remove_media_and_file(config, media_id):
             break
 
     # Delete the file first.
-    file_endpoint = config['host'] + '/entity/file/' \
-        + str(file_id) + '?_format=json'
+    file_endpoint = config['host'] + '/entity/file/' + str(file_id) + '?_format=json'
     file_response = issue_request(config, 'DELETE', file_endpoint)
     if file_response.status_code == 204:
         logging.info("File %s (from media %s) deleted.", file_id, media_id)
@@ -1416,8 +1421,7 @@ def remove_media_and_file(config, media_id):
 
     # Then the media.
     if file_response.status_code == 204:
-        media_endpoint = config['host'] + '/media/' \
-            + str(media_id) + '?_format=json'
+        media_endpoint = config['host'] + '/media/' + str(media_id) + '?_format=json'
         media_response = issue_request(config, 'DELETE', media_endpoint)
         if media_response.status_code == 204:
             logging.info("Media %s deleted.", media_id)
@@ -1434,7 +1438,15 @@ def remove_media_and_file(config, media_id):
 
 # @lru_cache(maxsize=None)
 def get_csv_data(config):
-    """Read the input CSV file, adding field templates if they exist.
+    """Read the input CSV data and prepare it for use in create, update, etc. tasks.
+
+       This function reads the source CSV file (or the CSV dump from Google Sheets or Excel),
+       applies some prepocessing to each CSV record (specifically, it adds any CSV field
+       templates that are registered in the config file, and it filters out any CSV
+       records or lines in the CSV file that begine with a #), and finally, writes out
+       a version of the CSV data to a file that appends .prepocessed to the input
+       CSV file name. It is this .prepocessed file that is used in create, update, etc.
+       tasks.
     """
     if os.path.isabs(config['input_csv']):
         input_csv_path = config['input_csv']
@@ -1450,21 +1462,20 @@ def get_csv_data(config):
         logging.error(message)
         sys.exit(message)
 
+    try:
+        csv_reader_file_handle = open(input_csv_path, 'r', encoding="utf-8", newline='')
+    except (UnicodeDecodeError):
+        message = 'Error: CSV file ' + input_csv_path + ' must be encoded in ASCII or UTF-8.'
+        logging.error(message)
+        sys.exit(message)
+
+    csv_writer_file_handle = open(input_csv_path + '.prepocessed', 'w+', newline='')
+    csv_reader = csv.DictReader(csv_reader_file_handle, delimiter=config['delimiter'])
+    csv_reader_fieldnames = csv_reader.fieldnames
+
     tasks = ['create', 'update']
     if config['task'] in tasks and 'csv_field_templates' in config and len(config['csv_field_templates']) > 0:
-        # If the config file contains CSV field templates, append them to the CSV data
-        # in the input file and write out the resulting CSV data to a new file. Then,
-        # use that as the input CSV file.
-        try:
-            csv_reader_file_handle = open(input_csv_path, 'r', encoding="utf-8", newline='')
-        except (UnicodeDecodeError):
-            message = 'Error: CSV file ' + input_csv_path + ' must be encoded in ASCII or UTF-8.'
-            logging.error(message)
-            sys.exit(message)
-
-        csv_writer_file_handle = open(input_csv_path + '.with_templates', 'w+', newline='')
-        csv_reader = csv.DictReader(csv_reader_file_handle, delimiter=config['delimiter'])
-        csv_reader_fieldnames = csv_reader.fieldnames
+        # If the config file contains CSV field templates, append them to the CSV data.
         # Make a copy of the column headers so we can skip adding templates to the new CSV
         # if they're present in the source CSV. We don't want fields in the source CSV to be
         # stomped on by templates.
@@ -1480,22 +1491,21 @@ def get_csv_data(config):
                 for field_name, field_value in template.items():
                     if field_name not in csv_reader_fieldnames_orig:
                         row[field_name] = field_value
-            csv_writer.writerow(row)
-        csv_writer_file_handle.close()
-        with_templates_csv_reader_file_handle = open(input_csv_path + '.with_templates', 'r')
-        with_templates_csv_reader = csv.DictReader(with_templates_csv_reader_file_handle, delimiter=config['delimiter'])
-        return with_templates_csv_reader
+            # Skip CSV records whose first column begin with #.
+            if not list(row.values())[0].startswith('#'):
+                csv_writer.writerow(row)
     else:
-        # If there are no CSV templates in the config file, use the CSV file identified
-        # in the input_csv config option as is.
-        try:
-            csv_reader_file_handle = open(input_csv_path, 'r', encoding="utf-8", newline='')
-        except (UnicodeDecodeError):
-            message = 'Error: CSV file ' + input_csv_path + ' must be encoded in ASCII or UTF-8.'
-            logging.error(message)
-            sys.exit(message)
-        csv_reader = csv.DictReader(csv_reader_file_handle, delimiter=config['delimiter'])
-        return csv_reader
+        csv_writer = csv.DictWriter(csv_writer_file_handle, fieldnames=csv_reader_fieldnames)
+        csv_writer.writeheader()
+        for row in csv_reader:
+            # Skip CSV records whose first column begin with #.
+            if not list(row.values())[0].startswith('#'):
+                csv_writer.writerow(row)
+
+    csv_writer_file_handle.close()
+    preprocessed_csv_reader_file_handle = open(input_csv_path + '.prepocessed', 'r')
+    preprocessed_csv_reader = csv.DictReader(preprocessed_csv_reader_file_handle, delimiter=config['delimiter'])
+    return preprocessed_csv_reader
 
 
 def get_term_pairs(config, vocab_id):
@@ -2671,15 +2681,13 @@ def get_csv_from_google_sheet(config):
     response = requests.get(url=csv_url, allow_redirects=True)
 
     if response.status_code == 404:
-        message = 'Workbench cannot find the Google spreadsheet at ' + \
-            config['input_csv'] + '. Please check the URL.'
+        message = 'Workbench cannot find the Google spreadsheet at ' + config['input_csv'] + '. Please check the URL.'
         logging.error(message)
         sys.exit('Error: ' + message)
 
-    not_authorized = [401, 403]
-    if response.status_code in not_authorized:
-        message = 'The Google spreadsheet at ' + config['input_csv'] + \
-            ' is not accessible. Please check its "Share" settings.'
+    # Sheets that aren't publicly readable return a 302 and then a 200 with a bunch of HTML for humans to look at.
+    if response.content.strip().startswith(b'<!DOCTYPE'):
+        message = 'The Google spreadsheet at ' + config['input_csv'] + ' is not accessible.\nPlease check its "Share" settings.'
         logging.error(message)
         sys.exit('Error: ' + message)
 
@@ -2688,7 +2696,7 @@ def get_csv_from_google_sheet(config):
 
 
 def get_csv_from_excel(config):
-    """Read the input Excel 2010 and up file, adding field templates if they exist.
+    """Read the input Excel 2010 (or later) file and write it out as CSV.
     """
     if os.path.isabs(config['input_csv']):
         input_excel_path = config['input_csv']
