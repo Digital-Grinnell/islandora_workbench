@@ -4,6 +4,7 @@
 import sys
 import os
 from ruamel.yaml import YAML
+import collections
 import unittest
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -21,10 +22,29 @@ class TestCompareStings(unittest.TestCase):
         self.assertTrue(res)
         res = workbench_utils.compare_strings('foo bar baz', 'foo   bar baz')
         self.assertTrue(res)
+        res = workbench_utils.compare_strings('Lastname,Firstname', 'Lastname, Firstname')
+        self.assertTrue(res)
+        res = workbench_utils.compare_strings('لدولي العاشر ليونيكود--', 'لدولي, العاشر []ليونيكود')
+        self.assertTrue(res)
 
     def test_strings_do_not_match(self):
         res = workbench_utils.compare_strings('foo', 'foot')
         self.assertFalse(res)
+
+
+class TestCsvRecordHasher(unittest.TestCase):
+
+    def test_hasher(self):
+        csv_record = collections.OrderedDict()
+        csv_record['one'] = 'eijco87we '
+        csv_record['two'] = 'jjjclsle300sloww'
+        csv_record['three'] = 'pppzzffr46wkkw'
+        csv_record['four'] = 'لدولي, العاشر []ليونيكود'
+        csv_record['four'] = ''
+        csv_record['six'] = 5
+
+        md5hash = workbench_utils.get_csv_record_hash(csv_record)
+        self.assertEqual(md5hash, 'bda4013d3695a98cd56d4d2b6a66fb4c')
 
 
 class TestSplitGeolocationString(unittest.TestCase):
@@ -55,6 +75,31 @@ class TestSplitGeolocationString(unittest.TestCase):
             config, r'\+49.16667, -123.93333@\+50.1,-120.5')
         self.assertDictEqual(res[0], {'lat': '+49.16667', 'lng': '-123.93333'})
         self.assertDictEqual(res[1], {'lat': '+50.1', 'lng': '-120.5'})
+
+
+class TestSplitLinkString(unittest.TestCase):
+
+    def test_split_link_string_single(self):
+        config = {'subdelimiter': '|'}
+        res = workbench_utils.split_link_string(config, 'http://www.foo.bar%%Foobar website')
+        self.assertDictEqual(res[0], {'uri': 'http://www.foo.bar', 'title': 'Foobar website'})
+
+    def test_split_geolocation_string_multiple(self):
+        config = {'subdelimiter': '|'}
+        res = workbench_utils.split_link_string(config, 'http://foobar.net%%Foobardotnet website|http://baz.com%%Baz website')
+        self.assertDictEqual(res[0], {'uri': 'http://foobar.net', 'title': 'Foobardotnet website'})
+        self.assertDictEqual(res[1], {'uri': 'http://baz.com', 'title': 'Baz website'})
+
+    def test_split_link_string_no_title_single(self):
+        config = {'subdelimiter': '|'}
+        res = workbench_utils.split_link_string(config, 'http://www.foo.bar')
+        self.assertDictEqual(res[0], {'uri': 'http://www.foo.bar', 'title': 'http://www.foo.bar'})
+
+    def test_split_geolocation_string_no_title_multiple(self):
+        config = {'subdelimiter': '|'}
+        res = workbench_utils.split_link_string(config, 'http://foobar.net|http://baz.com%%Baz website')
+        self.assertDictEqual(res[0], {'uri': 'http://foobar.net', 'title': 'http://foobar.net'})
+        self.assertDictEqual(res[1], {'uri': 'http://baz.com', 'title': 'Baz website'})
 
 
 class TestSplitTypedRelationString(unittest.TestCase):
@@ -121,6 +166,21 @@ class TestValidateLatlongValue(unittest.TestCase):
             self.assertFalse(res)
 
 
+class TestValidateLinkValue(unittest.TestCase):
+
+    def test_validate_good_link_values(self):
+        values = ['http://foo.com', 'http://foo1.com%%Foo Hardware']
+        for value in values:
+            res = workbench_utils.validate_link_value(value)
+            self.assertTrue(res)
+
+    def test_validate_bad_link_values(self):
+        values = ['foo.com', 'http://foo.com Foo Hardware']
+        for value in values:
+            res = workbench_utils.validate_latlong_value(value)
+            self.assertFalse(res)
+
+
 class TestValidateNodeCreatedDateValue(unittest.TestCase):
 
     def test_validate_good_date_string_values(self):
@@ -152,6 +212,9 @@ class TestValideCalendarDate(unittest.TestCase):
         bad_values = ['1900-05-45',
                       '1900-13-01',
                       '1900-02-31',
+                      '1900-00-31',
+                      '1900-00',
+                      '19000'
                       ]
         for bad_value in bad_values:
             res = workbench_utils.validate_calendar_date(bad_value)
@@ -165,19 +228,13 @@ class TestSetMediaType(unittest.TestCase):
         dir_path = os.path.dirname(os.path.realpath(__file__))
 
         # Media types are mapped from extensions.
-        types_config_file_path = os.path.join(
-            dir_path, 'assets', 'set_media_type_test', 'multi_types_config.yml')
+        types_config_file_path = os.path.join(dir_path, 'assets', 'set_media_type_test', 'multi_types_config.yml')
         with open(types_config_file_path, 'r') as f:
             multi_types_config_file_contents = f.read()
-        self.multi_types_config_yaml = yaml.load(
-            multi_types_config_file_contents)
+        self.multi_types_config_yaml = yaml.load(multi_types_config_file_contents)
 
         # Media type is set for all media.
-        type_config_file_path = os.path.join(
-            dir_path,
-            'assets',
-            'set_media_type_test',
-            'single_type_config.yml')
+        type_config_file_path = os.path.join(dir_path, 'assets', 'set_media_type_test', 'single_type_config.yml')
         with open(type_config_file_path, 'r') as f:
             single_type_config_file_contents = f.read()
         self.single_type_config_yaml = yaml.load(
@@ -216,7 +273,8 @@ class TestSetMediaType(unittest.TestCase):
 
 class TestGetCsvFromExcel(unittest.TestCase):
     """Note: this tests the extraction of CSV data from Excel only,
-       not using and Excel file as an input CSV file.
+       not using an Excel file as an input CSV file. That is tested
+       in TestCommentedCsvs in islandora_tests.py.
     """
     def setUp(self):
         self.config = {'input_dir': 'tests/assets/excel_test',
@@ -239,8 +297,6 @@ class TestGetCsvFromExcel(unittest.TestCase):
         fourth_row = csv_data[4]
         fourth_row_parts = fourth_row.split(',')
         self.assertEqual(fourth_row_parts[1], 'Title 4')
-
-        # @todo: Test CSV field templates.
 
     def tearDown(self):
         os.remove(self.csv_file_path)

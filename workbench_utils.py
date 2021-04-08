@@ -11,12 +11,14 @@ import logging
 import datetime
 import requests
 import subprocess
+import hashlib
 import mimetypes
 import collections
 import urllib.parse
+from pathlib import Path
 from ruamel.yaml import YAML, YAMLError
 from functools import lru_cache
-
+import shutil
 yaml = YAML()
 
 
@@ -88,6 +90,8 @@ def set_config_defaults(args):
         config['log_file_mode'] = 'a'
     if 'allow_missing_files' not in config:
         config['allow_missing_files'] = False
+    if 'update_mode' not in config:
+        config['update_mode'] = 'replace'
     if 'validate_title_length' not in config:
         config['validate_title_length'] = True
     if 'paged_content_from_directories' not in config:
@@ -114,6 +118,10 @@ def set_config_defaults(args):
         config['excel_worksheet'] = 'Sheet1'
     if 'excel_csv_filename' not in config:
         config['excel_csv_filename'] = 'excel.csv'
+    if 'use_node_title_for_media' not in config:
+        config['use_node_title_for_media'] = False
+    if 'delete_tmp_upload' not in config:
+        config['delete_tmp_upload'] = False
 
     if config['task'] == 'create':
         if 'id_field' not in config:
@@ -143,6 +151,28 @@ def set_config_defaults(args):
             config['media_types'].append(video)
             extracted_text = collections.OrderedDict({'extracted_text': ['txt']})
             config['media_types'].append(extracted_text)
+
+        # Set config['media_bundle_file_fields']. If 'media_fields' option is present in
+        # the config file, determine which field to use for the file, per media bundle.
+        # Note that 'media_file_fields' is the option used in the config file, and that
+        # config['media_bundle_file_fields'] is the internal name of the setting.
+        media_fields = dict({
+            'file': 'field_media_file',
+            'document': 'field_media_document',
+            'image': 'field_media_image',
+            'audio': 'field_media_audio_file',
+            'video': 'field_media_video_file',
+            'extracted_text': 'field_media_file',
+            'fits_technical_metadata': 'field_media_file'
+        })
+        if 'media_file_fields' in config:
+            for media_field in config['media_file_fields']:
+                for media_type, media_field in media_field.items():
+                    media_fields[media_type] = media_field
+        else:
+            config['media_fields'] = media_fields
+
+        config['media_bundle_file_fields'] = media_fields
 
     if config['task'] == 'create':
         if 'paged_content_sequence_seprator' not in config:
@@ -289,6 +319,39 @@ def issue_request(
     return response
 
 
+def get_drupal_core_version(config):
+    """Get Drupal's version number.
+    """
+    url = config['host'] + '/islandora_workbench_integration/core_version'
+    response = issue_request(config, 'GET', url)
+    if response.status_code == 200:
+        version = json.loads(response.text)
+        return version['core_version']
+    else:
+        logging.warning(
+            "Attempt to get Drupal core versionh number eturned a %s status code",
+            url,
+            response.status_code)
+        return False
+
+
+def check_drupal_core_version(config):
+    """Used during --check.
+    """
+    drupal_core_version = get_drupal_core_version(config)
+    if drupal_core_version is not False:
+        float_drupal_core_version = float(drupal_core_version[0:3])
+    else:
+        message = "Error: Workbench cannot determine Drupal's version number."
+        logging.error(message)
+        sys.exit('Error: ' + message)
+    if float_drupal_core_version < 9.1:
+        message = "Warning: Media creation in your version of Drupal (" + \
+            drupal_core_version + \
+            ") is less reliable than in Drupal 9.1 or higher."
+        print(message)
+
+
 def ping_node(config, nid):
     """Ping the node to see if it exists.
     """
@@ -376,6 +439,29 @@ def ping_remote_file(url):
         sys.exit('Error: ' + message)
 
 
+def get_nid_from_url_alias(config, url_alias):
+    """Gets a node ID from a URL alias.
+
+       Parameters
+       ----------
+        config : dict
+            The configuration object defined by set_config_defaults().
+        url_alias : string
+            The full URL alias, including http://, etc.
+        Returns
+        -------
+        int
+            The node ID, or False if the URL alias cannot be found.
+        """
+    url = url_alias + '?_format=json'
+    response = issue_request(config, 'GET', url)
+    if response.status_code != 200:
+        return False
+    else:
+        node = json.loads(response.text)
+        return node['nid'][0]['value']
+
+
 def get_field_definitions(config):
     """Get field definitions from Drupal.
     """
@@ -389,15 +475,12 @@ def get_field_definitions(config):
     fields = get_entity_fields(config, entity_type, bundle_type)
     for fieldname in fields:
         field_definitions[fieldname] = {}
-        raw_field_config = get_entity_field_config(
-            config, fieldname, entity_type, bundle_type)
+        raw_field_config = get_entity_field_config(config, fieldname, entity_type, bundle_type)
         field_config = json.loads(raw_field_config)
         field_definitions[fieldname]['entity_type'] = field_config['entity_type']
         field_definitions[fieldname]['required'] = field_config['required']
         field_definitions[fieldname]['label'] = field_config['label']
-        raw_vocabularies = [
-            x for x in field_config['dependencies']['config'] if re.match(
-                "^taxonomy.vocabulary.", x)]
+        raw_vocabularies = [x for x in field_config['dependencies']['config'] if re.match("^taxonomy.vocabulary.", x)]
         if len(raw_vocabularies) > 0:
             vocabularies = [x.replace("taxonomy.vocabulary.", '')
                             for x in raw_vocabularies]
@@ -407,8 +490,7 @@ def get_field_definitions(config):
         if entity_type == 'media':
             field_definitions[fieldname]['media_type'] = bundle_type
 
-        raw_field_storage = get_entity_field_storage(
-            config, fieldname, entity_type)
+        raw_field_storage = get_entity_field_storage(config, fieldname, entity_type)
         field_storage = json.loads(raw_field_storage)
         field_definitions[fieldname]['field_type'] = field_storage['type']
         field_definitions[fieldname]['cardinality'] = field_storage['cardinality']
@@ -423,6 +505,7 @@ def get_field_definitions(config):
         if field_storage['type'] == 'typed_relation' and 'rel_types' in field_config['settings']:
             field_definitions[fieldname]['typed_relations'] = field_config['settings']['rel_types']
 
+    field_definitions['title'] = {'entity_type': 'node', 'required': True, 'label': 'Title', 'field_type': 'string', 'cardinality': 1, 'max_length': 255, 'target_type': None}
     return field_definitions
 
 
@@ -494,6 +577,8 @@ def check_input(config, args):
 
     ping_islandora(config, print_message=False)
 
+    # check_drupal_core_version(config)
+
     base_fields = ['title', 'status', 'promote', 'sticky', 'uid', 'created']
 
     # Check the config file.
@@ -543,6 +628,13 @@ def check_input(config, args):
                     + joiner.join(update_required_options) + '.'
                 logging.error(message)
                 sys.exit('Error: ' + message)
+        update_mode_options = ['replace', 'append', 'delete']
+        if config['update_mode'] not in update_mode_options:
+            message = 'Your "update_mode" config option must be one of the following: ' \
+                + joiner.join(update_mode_options) + '.'
+            logging.error(message)
+            sys.exit('Error: ' + message)
+
     if config['task'] == 'delete':
         delete_required_options = [
             'task',
@@ -797,6 +889,9 @@ def check_input(config, args):
         validate_geolocation_values_csv_data = get_csv_data(config)
         validate_geolocation_fields(config, field_definitions, validate_geolocation_values_csv_data)
 
+        validate_link_values_csv_data = get_csv_data(config)
+        validate_link_fields(config, field_definitions, validate_link_values_csv_data)
+
         validate_edtf_values_csv_data = get_csv_data(config)
         validate_edtf_fields(config, field_definitions, validate_edtf_values_csv_data)
 
@@ -830,9 +925,8 @@ def check_input(config, args):
         if config['validate_title_length']:
             validate_title_csv_data = get_csv_data(config)
             for count, row in enumerate(validate_title_csv_data, start=1):
-                if len(row['title']) > 255:
-                    message = "The 'title' column in row " + \
-                        str(count) + " of your CSV file exceeds Drupal's maximum length of 255 characters."
+                if 'title' in row and len(row['title']) > 255:
+                    message = "The 'title' column in row " + str(count) + " of your CSV file exceeds Drupal's maximum length of 255 characters."
                     logging.error(message)
                     sys.exit('Error: ' + message)
 
@@ -1071,7 +1165,8 @@ def check_input_for_create_from_files(config, args):
 def log_field_cardinality_violation(field_name, record_id, cardinality):
     """Writes an entry to the log during create/update tasks if any field values
        are sliced off. Workbench does this if the number of values in a field
-       exceeds the field's cardinality.
+       exceeds the field's cardinality. record_id could be a value from the
+       configured id_field or a node ID.
     """
     logging.warning(
         "Adding all values in CSV field %s for record %s would exceed maximum " +
@@ -1099,12 +1194,11 @@ def validate_language_code(langcode):
 
 
 def clean_csv_values(row):
-    """Strip leading and trailing whitespace from row values. Could be used in the
-       future for other normalization tasks.
+    """Convert row values to strings and strip leading and trailing whitespace.
+       Could be used in the future for other normalization tasks.
     """
     for field in row:
-        if isinstance(row[field], str):
-            row[field] = row[field].strip()
+        row[field] = str(row[field]).strip()
     return row
 
 
@@ -1115,7 +1209,7 @@ def truncate_csv_value(field_name, record_id, field_config, value):
     """
     if isinstance(value, str) and 'max_length' in field_config:
         max_length = field_config['max_length']
-        if max_length is not None and len(value) > max_length:
+        if max_length is not None and len(value) > int(max_length):
             original_value = value
             value = value[:max_length]
             logging.warning(
@@ -1196,6 +1290,28 @@ def split_geolocation_string(config, geolocation_string):
     return return_list
 
 
+def split_link_string(config, link_string):
+    """Fields of type 'link' are represented in the CSV file using a structured string,
+       specifically uri%%title, e.g. "https://www.lib.sfu.ca%%SFU Library Website".
+       This function takes one of those strings (optionally with a multivalue subdelimiter)
+       and returns a list of dictionaries with 'uri' and 'title' keys required by the
+       'link' field type.
+    """
+    return_list = []
+    temp_list = link_string.split(config['subdelimiter'])
+    for item in temp_list:
+        if '%%' in item:
+            item_list = item.split('%%')
+            item_dict = {'uri': item_list[0].strip(), 'title': item_list[1].strip()}
+            return_list.append(item_dict)
+        else:
+            # If there is no %% and title, use the URL as the title.
+            item_dict = {'uri': item.strip(), 'title': item.strip()}
+            return_list.append(item_dict)
+
+    return return_list
+
+
 def validate_media_use_tid(config):
     """Validate whether the term ID or URI provided in the config value for media_use_tid is
        in the Islandora Media Use vocabulary.
@@ -1254,16 +1370,21 @@ def execute_bootstrap_script(path_to_script, path_to_config_file):
 def create_media(config, filename, node_uri, node_csv_row):
     """node_csv_row is an OrderedDict, e.g.
        OrderedDict([('file', 'IMG_5083.JPG'), ('id', '05'), ('title', 'Alcatraz Island').
+
+       Returns the HTTP status code from the attempt to create the media, or False if
+       it doesn't have sufficient information to create the media.
     """
     if config['nodes_only'] is True:
         return
-
+    is_remote = False
     filename = filename.strip()
 
     if filename.startswith('http'):
-        download_remote_file(config, filename)
-        file_path = os.path.join(config['input_dir'], filename.split("/")[-1])
-        filename = filename.split("/")[-1]
+        file_path = download_remote_file(config, filename, node_csv_row)
+        if file_path is False:
+            return False
+        filename = file_path.split("/")[-1]
+        is_remote = True
     elif os.path.isabs(filename):
         file_path = filename
     else:
@@ -1284,8 +1405,12 @@ def create_media(config, filename, node_uri, node_csv_row):
         'Content-Type': mimetype[0],
         'Content-Location': location
     }
-    binary_data = open(os.path.join(config['input_dir'], filename), 'rb')
+    binary_data = open(file_path, 'rb')
     media_response = issue_request(config, 'PUT', media_endpoint, media_headers, '', binary_data)
+    if is_remote and config['delete_tmp_upload'] is True:
+        containing_folder = os.path.join(config['input_dir'], re.sub('[^A-Za-z0-9]+', '_', node_csv_row[config['id_field']]))
+        shutil.rmtree(containing_folder)
+
     if media_response.status_code == 201:
         if 'location' in media_response.headers:
             # A 201 response provides a 'location' header, but a '204' response does not.
@@ -1486,21 +1611,46 @@ def get_csv_data(config):
                     csv_reader_fieldnames.append(field_name)
         csv_writer = csv.DictWriter(csv_writer_file_handle, fieldnames=csv_reader_fieldnames)
         csv_writer.writeheader()
+        row_num = 0
+        unique_identifiers = []
         for row in csv_reader:
+            row_num += 1
             for template in config['csv_field_templates']:
                 for field_name, field_value in template.items():
                     if field_name not in csv_reader_fieldnames_orig:
                         row[field_name] = field_value
             # Skip CSV records whose first column begin with #.
             if not list(row.values())[0].startswith('#'):
-                csv_writer.writerow(row)
+                try:
+                    unique_identifiers.append(row[config['id_field']])
+                    csv_writer.writerow(row)
+                except (ValueError):
+                    message = "Error: Row " + str(row_num) + ' in your CSV file ' + \
+                              "has more columns (" + str(len(row)) + ") than there are headers (" + \
+                              str(len(csv_reader.fieldnames)) + ').'
+                    logging.error(message)
+                    sys.exit(message)
+        repeats = set(([x for x in unique_identifiers if unique_identifiers.count(x) > 1]))
+        if len(repeats) > 0:
+            message = "duplicated identifiers found: " + str(repeats)
+            logging.error(message)
+            sys.exit(message)
     else:
         csv_writer = csv.DictWriter(csv_writer_file_handle, fieldnames=csv_reader_fieldnames)
         csv_writer.writeheader()
+        row_num = 0
         for row in csv_reader:
+            row_num += 1
             # Skip CSV records whose first column begin with #.
             if not list(row.values())[0].startswith('#'):
-                csv_writer.writerow(row)
+                try:
+                    csv_writer.writerow(row)
+                except (ValueError):
+                    message = "Error: Row " + str(row_num) + ' in your CSV file ' + \
+                              "has more columns (" + str(len(row)) + ") than there are headers (" + \
+                              str(len(csv_reader.fieldnames)) + ').'
+                    logging.error(message)
+                    sys.exit(message)
 
     csv_writer_file_handle.close()
     preprocessed_csv_reader_file_handle = open(input_csv_path + '.prepocessed', 'r')
@@ -1549,7 +1699,7 @@ def get_term_id_from_uri(config, uri):
        taxonomy uses to store URIs (it's either field_external_uri or field_authority_link),
        we need to check both options in the "Term from URI" View.
     """
-    # Some vocabuluaries use this View.
+    # Some vocabularies use this View.
     terms_with_uri = []
     term_from_uri_url = config['host'] \
         + '/term_from_uri?_format=json&uri=' + uri.replace('#', '%23')
@@ -1640,7 +1790,7 @@ def create_term(config, vocab_id, term_name):
     term = {
         "vid": [
            {
-               "target_id": vocab_id,
+               "target_id": str(vocab_id),
                "target_type": "taxonomy_vocabulary"
            }
         ],
@@ -1708,6 +1858,17 @@ def create_term(config, vocab_id, term_name):
             term_name,
             response.status_code)
         return False
+
+
+def get_term_uuid(config, term_id):
+    """Given a term ID, get the term's UUID.
+    """
+    term_url = config['host'] + '/taxonomy/term/' + str(term_id) + '?_format=json'
+    response = issue_request(config, 'GET', term_url)
+    term = json.loads(response.text)
+    uuid = term['uuid'][0]['value']
+
+    return uuid
 
 
 def create_url_alias(config, node_id, url_alias):
@@ -1814,8 +1975,9 @@ def compare_strings(known, unknown):
     known = known.lower()
     unknown = unknown.lower()
     # Remove all punctuation.
-    known = known.translate(str.maketrans('', '', string.punctuation))
-    unknown = unknown.translate(str.maketrans('', '', string.punctuation))
+    for p in string.punctuation:
+        known = known.replace(p, ' ')
+        unknown = unknown.replace(p, ' ')
     # Replaces whitespace with a single space.
     known = " ".join(known.split())
     unknown = " ".join(unknown.split())
@@ -1824,6 +1986,24 @@ def compare_strings(known, unknown):
         return True
     else:
         return False
+
+
+def get_csv_record_hash(row):
+    """Concatenate values in the CSV record and get an MD5 hash on the
+       resulting string.
+    """
+    serialized_row = ''
+    for field in row:
+        if isinstance(row[field], str) or isinstance(row[field], int):
+            if isinstance(row[field], int):
+                row[field] = str(row[field])
+            row_value = row[field].strip()
+            row_value = " ".join(row_value.split())
+            serialized_row = serialized_row + row_value + " "
+
+    serialized_row = bytes(serialized_row.strip().lower(), 'utf-8')
+    hash_object = hashlib.md5(serialized_row)
+    return hash_object.hexdigest()
 
 
 def validate_csv_field_cardinality(config, field_definitions, csv_data):
@@ -1837,7 +2017,7 @@ def validate_csv_field_cardinality(config, field_definitions, csv_data):
         if csv_header in field_definitions.keys():
             cardinality = field_definitions[csv_header]['cardinality']
             # We don't care about cardinality of -1 (unlimited).
-            if cardinality > 0:
+            if int(cardinality) > 0:
                 field_cardinalities[csv_header] = cardinality
 
     for count, row in enumerate(csv_data, start=1):
@@ -1849,7 +2029,7 @@ def validate_csv_field_cardinality(config, field_definitions, csv_data):
                 delimited_field_values = row[field_name].split(config['subdelimiter'])
                 if field_cardinalities[field_name] == 1 and len(delimited_field_values) > 1:
                     if config['task'] == 'create':
-                        message = 'CSV field "' + field_name + '" in (!) record with ID ' + \
+                        message = 'CSV field "' + field_name + '" in record with ID ' + \
                             row[config['id_field']] + ' contains more values than the number '
                     if config['task'] == 'update':
                         message = 'CSV field "' + field_name + '" in record with node ID ' \
@@ -1858,9 +2038,9 @@ def validate_csv_field_cardinality(config, field_definitions, csv_data):
                         field_cardinalities[field_name]) + '). Workbench will add only the first value.'
                     print('Warning: ' + message + message_2)
                     logging.warning(message + message_2)
-                if field_cardinalities[field_name] > 1 and len(delimited_field_values) > field_cardinalities[field_name]:
+                if int(field_cardinalities[field_name]) > 1 and len(delimited_field_values) > field_cardinalities[field_name]:
                     if config['task'] == 'create':
-                        message = 'CSV field "' + field_name + '" in (!) record with ID ' + \
+                        message = 'CSV field "' + field_name + '" in record with ID ' + \
                             row[config['id_field']] + ' contains more values than the number '
                     if config['task'] == 'update':
                         message = 'CSV field "' + field_name + '" in record with node ID ' \
@@ -1895,8 +2075,7 @@ def validate_csv_field_length(config, field_definitions, csv_data):
                     config['subdelimiter'])
                 for field_value in delimited_field_values:
                     field_value_length = len(field_value)
-                    if field_name in field_max_lengths and len(
-                            field_value) > field_max_lengths[field_name]:
+                    if field_name in field_max_lengths and len(field_value) > int(field_max_lengths[field_name]):
                         if config['task'] == 'create':
                             message = 'CSV field "' + field_name + '" in record with ID ' + \
                                 row[config['id_field']] + ' contains a value that is longer (' + str(len(field_value)) + ' characters)'
@@ -1933,10 +2112,41 @@ def validate_geolocation_fields(config, field_definitions, csv_data):
         logging.info(message)
 
 
+def validate_link_fields(config, field_definitions, csv_data):
+    """Validate lat,long values in fields that are of type 'geolocation'.
+    """
+    link_fields_present = False
+    for count, row in enumerate(csv_data, start=1):
+        for field_name in field_definitions.keys():
+            if field_definitions[field_name]['field_type'] == 'link':
+                if field_name in row:
+                    link_fields_present = True
+                    delimited_field_values = row[field_name].split(config['subdelimiter'])
+                    for field_value in delimited_field_values:
+                        if len(field_value.strip()):
+                            if not validate_link_value(field_value.strip()):
+                                message = 'Value in field "' + field_name + '" in row ' + str(count) + \
+                                    ' (' + field_value + ') is not a valid link field value.'
+                                logging.error(message)
+                                sys.exit('Error: ' + message)
+
+    if link_fields_present is True:
+        message = "OK, link field values in the CSV file validate."
+        print(message)
+        logging.info(message)
+
+
 def validate_latlong_value(latlong):
     # Remove leading \ that may be present if input CSV is from a spreadsheet.
     latlong = latlong.lstrip('\\')
     if re.match(r"^[-+]?([1-8]?\d(\.\d+)?|90(\.0+)?),\s*[-+]?(180(\.0+)?|((1[0-7]\d)|([1-9]?\d))(\.\d+)?)$", latlong):
+        return True
+    else:
+        return False
+
+
+def validate_link_value(link_value):
+    if re.match(r"^http://.+(%%.+)?$", link_value):
         return True
     else:
         return False
@@ -2534,11 +2744,7 @@ def write_to_output_csv(config, id, node_json):
     csvfile.close()
 
 
-def create_children_from_directory(
-        config,
-        parent_csv_record,
-        parent_node_id,
-        parent_title):
+def create_children_from_directory(config, parent_csv_record, parent_node_id, parent_title):
     # These objects will have a title (derived from filename), an ID based on the parent's
     # id, and a config-defined Islandora model. Content type and status are inherited
     # as is from parent. The weight assigned to the page is the last segment in the filename,
@@ -2581,12 +2787,11 @@ def create_children_from_directory(
             ],
             'field_weight': [
                 {'value': weight}
-            ],
-            'field_display_hints': [
-                {'target_id': parent_csv_record['field_display_hints'],
-                 'target_type': 'taxonomy_term'}
             ]
         }
+
+        if 'field_display_hints' in parent_csv_record:
+            node_json['field_display_hints'] = [{'target_id': parent_csv_record['field_display_hints'], 'target_type': 'taxonomy_term'}]
 
         # Some optional base fields, inherited from the parent object.
         if 'uid' in parent_csv_record:
@@ -2611,36 +2816,27 @@ def create_children_from_directory(
             None)
         if node_response.status_code == 201:
             node_uri = node_response.headers['location']
-            print(
-                '+ Node for child "' +
-                page_title +
-                '" created at ' +
-                node_uri +
-                '.')
-            logging.info(
-                'Node for child "%s" created at %s.',
-                page_title,
-                node_uri)
+            print('+ Node for child "' + page_title + '" created at ' + node_uri + '.')
+            logging.info('Node for child "%s" created at %s.', page_title, node_uri)
             if 'output_csv' in config.keys():
-                write_to_output_csv(
-                    config, page_identifier, node_response.text)
+                write_to_output_csv(config, page_identifier, node_response.text)
 
             node_nid = node_uri.rsplit('/', 1)[-1]
             write_rollback_node_id(config, node_nid)
-        else:
-            logging.warning(
-                'Node for page "%s" not created, HTTP response code was %s.',
-                page_identifier,
-                node_response.status_code)
 
-        page_file_path = os.path.join(parent_id, page_file_name)
-        fake_csv_record = collections.OrderedDict()
-        fake_csv_record['title'] = page_title
-        media_response_status_code = create_media(
-            config, page_file_path, node_uri, fake_csv_record)
-        allowed_media_response_codes = [201, 204]
-        if media_response_status_code in allowed_media_response_codes:
-            logging.info("Media for %s created.", page_file_path)
+            page_file_path = os.path.join(parent_id, page_file_name)
+            fake_csv_record = collections.OrderedDict()
+            fake_csv_record['title'] = page_title
+            media_response_status_code = create_media(config, page_file_path, node_uri, fake_csv_record)
+            allowed_media_response_codes = [201, 204]
+            if media_response_status_code in allowed_media_response_codes:
+                if media_response_status_code is False:
+                    logging.info("Media for %s not created.", page_file_path)
+                    continue
+                else:
+                    logging.info("Media for %s created.", page_file_path)
+        else:
+            logging.warning('Node for page "%s" not created, HTTP response code was %s.', page_identifier, node_response.status_code)
 
 
 def write_rollback_config(config):
@@ -2736,27 +2932,68 @@ def get_csv_from_excel(config):
     csv_writer_file_handle.close()
 
 
-def download_remote_file(config, url):
+def get_extension_from_mimetype(mimetype):
+    # mimetypes.add_type() is not working, e.g. mimetypes.add_type('image/jpeg', '.jpg')
+    # Maybe related to https://bugs.python.org/issue4963? In the meantime, provide our own
+    # MIMETYPE to extension mapping for common types, then let mimetypes guess at others.
+    map = {'image/jpeg': '.jpg',
+           'image/jp2': '.jp2',
+           'image/png': '.png',
+           'application/octet-stream': '.bin'
+           }
+    if mimetype in map:
+        return map[mimetype]
+    else:
+        return mimetypes.guess_extension(mimetype)
+
+
+def download_remote_file(config, url, node_csv_row):
     sections = urllib.parse.urlparse(url)
     try:
         response = requests.get(url, allow_redirects=True)
-        return response.status_code
     except requests.exceptions.Timeout as err_timeout:
         message = 'Workbench timed out trying to reach ' + \
             sections.netloc + ' while connecting to ' + url + '. Please verify that URL and check your network connection.'
         logging.error(message)
         logging.error(err_timeout)
         print('Error: ' + message)
+        return False
     except requests.exceptions.ConnectionError as error_connection:
         message = 'Workbench cannot connect to ' + \
             sections.netloc + ' while connecting to ' + url + '. Please verify that URL and check your network connection.'
         logging.error(message)
         logging.error(error_connection)
         print('Error: ' + message)
+        return False
 
     # create_media() references the path of the downloaded file.
-    downloaded_file_path = os.path.join(config['input_dir'], url.split("/")[-1])
-    open(downloaded_file_path, 'wb+').write(response.content)
+    subdir = os.path.join(config['input_dir'], re.sub('[^A-Za-z0-9]+', '_', node_csv_row[config['id_field']]))
+    Path(subdir).mkdir(parents=True, exist_ok=True)
+
+    if config["use_node_title_for_media"]:
+        filename = re.sub('[^A-Za-z0-9]+', '_', node_csv_row['title'])
+        if filename[-1] == '_':
+            filename = filename[:-1]
+        downloaded_file_path = os.path.join(subdir, filename)
+        file_extension = os.path.splitext(downloaded_file_path)[1]
+    else:
+        downloaded_file_path = os.path.join(subdir, url.split("/")[-1])
+        file_extension = os.path.splitext(url)[1]
+
+    f = open(downloaded_file_path, 'wb+')
+    f.write(response.content)
+    f.close
+
+    if file_extension == '':
+        try:
+            mimetype = response.headers['content-type']
+        except KeyError:
+            mimetype = 'application/octet-stream'
+        ext = get_extension_from_mimetype(mimetype)
+        os.rename(downloaded_file_path, downloaded_file_path + ext)
+        downloaded_file_path = downloaded_file_path + ext
+
+    return downloaded_file_path
 
 
 def get_csv_template(config, args):
