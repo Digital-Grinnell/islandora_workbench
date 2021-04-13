@@ -1,0 +1,6 @@
+task: create
+host: "https://icg-islandora.williams.edu/"
+username: Test
+password: islandora
+# input_csv: 'https://docs.google.com/spreadsheets/d/1RLrjb5BrlJNaasFIxrC4Ibcfg1nVpqpzqtKrKV4l2rw/edit?usp=sharing'
+input_csv: 'https://docs.google.com/spreadsheets/d/12QezZCbW2ZIO8WJd8kpMgnt6OI-JVSXQ-rTs-0LA4mI/'
